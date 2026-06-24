@@ -293,6 +293,7 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.media.AudioManager
 
 class UniversalAutomatorService : AccessibilityService() {
 
@@ -306,6 +307,10 @@ class UniversalAutomatorService : AccessibilityService() {
 
     private val executionHandler = Handler(Looper.getMainLooper())
     private var playlistBypassLock = false
+
+    private lateinit var audioManager: AudioManager
+    private var originalVolume: Int = -1
+    private var isMutedForAd: Boolean = false
 
     private var lastSkipClickTime: Long = 0
     private var lastBypassTime: Long = 0
@@ -362,6 +367,7 @@ class UniversalAutomatorService : AccessibilityService() {
 //        }
 //    }
 override fun onAccessibilityEvent(event: AccessibilityEvent) {
+
     if (!isMasterSwitchOn) return
 
     // 1. Check who fired the event. (This works for the PiP mini-player too!)
@@ -428,40 +434,80 @@ override fun onAccessibilityEvent(event: AccessibilityEvent) {
     // ==========================================
     // 🎯 PRECISION SNIPER
     // ==========================================
+//    private fun huntForSkipButton(node: AccessibilityNodeInfo?): Boolean {
+//        if (node == null) return false
+//        if (!isActuallyOnScreen(node)) return false
+//
+//        val currentTime = System.currentTimeMillis()
+//        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+//        val visibleText = node.text?.toString()?.lowercase() ?: ""
+//
+//        val isSkipId = viewId.contains("skip_ad_button") || viewId.contains("skip_button") || viewId.contains("ad_action_button")
+//        val isExactSkipText = visibleText.contains("skip ad") || visibleText == "skip"
+//
+//        if (isSkipId || isExactSkipText) {
+//            if (currentTime - lastSkipClickTime < 5000) return false
+//
+//            var target: AccessibilityNodeInfo? = node
+//            var successfullyClicked = false
+//            while (target != null) {
+//                if (target.isClickable) {
+//                    target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+//                    successfullyClicked = true
+//                    break
+//                }
+//                target = target.parent
+//            }
+//
+//            if (!successfullyClicked) {
+//                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+//            }
+//
+//            lastSkipClickTime = currentTime
+//            Toast.makeText(applicationContext, "YouSkip: Smashed the Skip Button!", Toast.LENGTH_SHORT).show()
+//            return true
+//        }
+//
+//        for (i in 0 until node.childCount) {
+//            if (huntForSkipButton(node.getChild(i))) return true
+//        }
+//        return false
+//    }
     private fun huntForSkipButton(node: AccessibilityNodeInfo?): Boolean {
         if (node == null) return false
         if (!isActuallyOnScreen(node)) return false
 
-        val currentTime = System.currentTimeMillis()
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
         val visibleText = node.text?.toString()?.lowercase() ?: ""
 
-        val isSkipId = viewId.contains("skip_ad_button") || viewId.contains("skip_button") || viewId.contains("ad_action_button")
-        val isExactSkipText = visibleText.contains("skip ad") || visibleText == "skip"
+        // 1. STRICT TARGETING: Only target specific IDs or exact text.
+        // We removed 'ad_action_button' because that often includes "Learn More" or "Visit Website" buttons.
+        val isSkipId = viewId.contains("skip_ad_button") || viewId.contains("skip_button")
+        val isExactSkipText = visibleText == "skip ad" || visibleText == "skip"
 
         if (isSkipId || isExactSkipText) {
-            if (currentTime - lastSkipClickTime < 5000) return false
+            // Prevent clicking more than once every 5 seconds to avoid UI glitches
+            val currentTime = System.currentTimeMillis()
+            if (currentTime - lastSkipClickTime < 5000) return true
 
-            var target: AccessibilityNodeInfo? = node
-            var successfullyClicked = false
-            while (target != null) {
-                if (target.isClickable) {
-                    target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    successfullyClicked = true
-                    break
-                }
-                target = target.parent
-            }
-
-            if (!successfullyClicked) {
+            // 2. SURGICAL CLICK: Only perform action if it's explicitly clickable
+            if (node.isClickable) {
                 node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                lastSkipClickTime = currentTime
+                Toast.makeText(applicationContext, "YouSkip: Smashed the Skip Button!", Toast.LENGTH_SHORT).show()
+                return true
+            } else {
+                // If the button itself isn't clickable, try its immediate parent, but ONLY if it looks like a button
+                val parent = node.parent
+                if (parent != null && parent.isClickable) {
+                    parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    lastSkipClickTime = currentTime
+                    return true
+                }
             }
-
-            lastSkipClickTime = currentTime
-            Toast.makeText(applicationContext, "YouSkip: Smashed the Skip Button!", Toast.LENGTH_SHORT).show()
-            return true
         }
 
+        // 3. RECURSION: Keep searching deeper
         for (i in 0 until node.childCount) {
             if (huntForSkipButton(node.getChild(i))) return true
         }
@@ -510,116 +556,137 @@ override fun onAccessibilityEvent(event: AccessibilityEvent) {
         }
         return false
     }
+    private fun isUnskippableAdPlaying(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
 
-    private fun findNodeByResourceOrDesc(node: AccessibilityNodeInfo?, target: String): AccessibilityNodeInfo? {
-        if (node == null) return null
-        if (!isActuallyOnScreen(node)) return null
-
+        val text = node.text?.toString()?.lowercase() ?: ""
         val desc = node.contentDescription?.toString()?.lowercase() ?: ""
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+        val id = node.viewIdResourceName?.lowercase() ?: ""
 
-        if (desc.contains(target) || viewId.contains(target)) {
-            var interactiveTarget: AccessibilityNodeInfo? = node
-            while (interactiveTarget != null && !interactiveTarget.isClickable) {
-                interactiveTarget = interactiveTarget.parent
-            }
-            if (interactiveTarget?.isClickable == true) return interactiveTarget
-        }
+        // Indicators of an unskippable ad
+        val isAdBadge = text.contains("ad •") || text.matches(Regex("ad \\d+ of \\d+")) || text == "sponsored"
+        val isAdId = id.contains("ad_progress") || id.contains("ad_countdown")
+
+        if (isAdBadge || isAdId) return true
+
+        // Look through children nodes
         for (i in 0 until node.childCount) {
-            val result = findNodeByResourceOrDesc(node.getChild(i), target)
-            if (result != null) return result
+            if (isUnskippableAdPlaying(node.getChild(i))) {
+                return true
+            }
         }
-        return null
+        return false
     }
+
+//    private fun findNodeByResourceOrDesc(node: AccessibilityNodeInfo?, target: String): AccessibilityNodeInfo? {
+//        if (node == null) return null
+//        if (!isActuallyOnScreen(node)) return null
+//
+//        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+//        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+//
+//        if (desc.contains(target) || viewId.contains(target)) {
+//            var interactiveTarget: AccessibilityNodeInfo? = node
+//            while (interactiveTarget != null && !interactiveTarget.isClickable) {
+//                interactiveTarget = interactiveTarget.parent
+//            }
+//            if (interactiveTarget?.isClickable == true) return interactiveTarget
+//        }
+//        for (i in 0 until node.childCount) {
+//            val result = findNodeByResourceOrDesc(node.getChild(i), target)
+//            if (result != null) return result
+//        }
+//        return null
+//    }
 
     // ==========================================
     // 🚦 SMART BYPASS ROUTER
     // ==========================================
-    private fun routeAdBypass(rootNode: AccessibilityNodeInfo) {
-        val currentTime = System.currentTimeMillis()
-
-        // Increased cooldown to 20 seconds to prevent total chaos if YouTube glitches
-        if (currentTime - lastBypassTime < 20000) return
-
-        val isPlaylistActive = findNodeByResourceOrDesc(rootNode, "playlist") != null
-
-        if (isPlaylistActive) {
-            executePlaylistBypass(rootNode, currentTime)
-        } else {
-            executeCloseAndReopenBypass(rootNode, currentTime)
-        }
-    }
-
-    private fun executePlaylistBypass(rootNode: AccessibilityNodeInfo, currentTime: Long) {
-        val nextButton = findNodeByResourceOrDesc(rootNode, "next") ?: return
-
-        playlistBypassLock = true
-        lastBypassTime = currentTime
-        Toast.makeText(applicationContext, "YouSkip: Playlist Bypass!", Toast.LENGTH_SHORT).show()
-
-        nextButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-        executionHandler.postDelayed({
-            val newActiveRoot = rootInActiveWindow ?: return@postDelayed
-            val prevButton = findNodeByResourceOrDesc(newActiveRoot, "previous")
-            prevButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            executionHandler.postDelayed({ playlistBypassLock = false }, 2000)
-        }, 1000)
-    }
+//    private fun routeAdBypass(rootNode: AccessibilityNodeInfo) {
+//        val currentTime = System.currentTimeMillis()
+//
+//        // Increased cooldown to 20 seconds to prevent total chaos if YouTube glitches
+//        if (currentTime - lastBypassTime < 20000) return
+//
+//        val isPlaylistActive = findNodeByResourceOrDesc(rootNode, "playlist") != null
+//
+//        if (isPlaylistActive) {
+//            executePlaylistBypass(rootNode, currentTime)
+//        } else {
+//            executeCloseAndReopenBypass(rootNode, currentTime)
+//        }
+//    }
+//
+//    private fun executePlaylistBypass(rootNode: AccessibilityNodeInfo, currentTime: Long) {
+//        val nextButton = findNodeByResourceOrDesc(rootNode, "next") ?: return
+//
+//        playlistBypassLock = true
+//        lastBypassTime = currentTime
+//        Toast.makeText(applicationContext, "YouSkip: Playlist Bypass!", Toast.LENGTH_SHORT).show()
+//
+//        nextButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+//
+//        executionHandler.postDelayed({
+//            val newActiveRoot = rootInActiveWindow ?: return@postDelayed
+//            val prevButton = findNodeByResourceOrDesc(newActiveRoot, "previous")
+//            prevButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+//            executionHandler.postDelayed({ playlistBypassLock = false }, 2000)
+//        }, 1000)
+//    }
 
     // THE UPGRADED REBOOT SEQUENCE
-    private fun executeCloseAndReopenBypass(rootNode: AccessibilityNodeInfo, currentTime: Long) {
-        playlistBypassLock = true
-        lastBypassTime = currentTime
-        Toast.makeText(applicationContext, "YouSkip: Rebooting Video...", Toast.LENGTH_SHORT).show()
-
-        // 1. Minimize the video (triggers the shrink animation)
-        performGlobalAction(GLOBAL_ACTION_BACK)
-
-        // INCREASED DELAY: Wait 1200ms to let the mini-player animation completely finish and settle
-        executionHandler.postDelayed({
-            val newRoot = rootInActiveWindow ?: return@postDelayed
-
-            // TARGETED SEARCH: Specifically hunt for YouTube's mini-player close button IDs
-            val closeButton = findNodeByResourceOrDesc(newRoot, "close")
-                ?: findNodeByResourceOrDesc(newRoot, "dismiss")
-                ?: findNodeByResourceOrDesc(newRoot, "miniplayer_close")
-
-            closeButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-            // Wait 1000ms for the mini-player to vanish, then strike
-            executionHandler.postDelayed({
-                val feedRoot = rootInActiveWindow ?: return@postDelayed
-
-                // Strike the video to reopen it
-                val firstVideo = findUniversalVideoThumbnail(feedRoot)
-                firstVideo?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-                playlistBypassLock = false
-            }, 1000)
-        }, 1200)
-    }
+//    private fun executeCloseAndReopenBypass(rootNode: AccessibilityNodeInfo, currentTime: Long) {
+//        playlistBypassLock = true
+//        lastBypassTime = currentTime
+//        Toast.makeText(applicationContext, "YouSkip: Rebooting Video...", Toast.LENGTH_SHORT).show()
+//
+//        // 1. Minimize the video (triggers the shrink animation)
+//        performGlobalAction(GLOBAL_ACTION_BACK)
+//
+//        // INCREASED DELAY: Wait 1200ms to let the mini-player animation completely finish and settle
+//        executionHandler.postDelayed({
+//            val newRoot = rootInActiveWindow ?: return@postDelayed
+//
+//            // TARGETED SEARCH: Specifically hunt for YouTube's mini-player close button IDs
+//            val closeButton = findNodeByResourceOrDesc(newRoot, "close")
+//                ?: findNodeByResourceOrDesc(newRoot, "dismiss")
+//                ?: findNodeByResourceOrDesc(newRoot, "miniplayer_close")
+//
+//            closeButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+//
+//            // Wait 1000ms for the mini-player to vanish, then strike
+//            executionHandler.postDelayed({
+//                val feedRoot = rootInActiveWindow ?: return@postDelayed
+//
+//                // Strike the video to reopen it
+//                val firstVideo = findUniversalVideoThumbnail(feedRoot)
+//                firstVideo?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+//
+//                playlistBypassLock = false
+//            }, 1000)
+//        }, 1200)
+//    }
 
     // THE UPGRADED VIDEO HUNTER
-    private fun findUniversalVideoThumbnail(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-
-        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
-
-        // This looks for standard video cards, but ignores shorts/ads
-        val isVideoThumbnail = (desc.contains("views") || desc.contains("ago") || viewId.contains("video_thumbnail"))
-        val isNotAd = !desc.contains("sponsored") && !desc.contains("ad ·")
-
-        if (isVideoThumbnail && isNotAd && node.isClickable) {
-            return node
-        }
-        for (i in 0 until node.childCount) {
-            val result = findUniversalVideoThumbnail(node.getChild(i))
-            if (result != null) return result
-        }
-        return null
-    }
+//    private fun findUniversalVideoThumbnail(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+//        if (node == null) return null
+//
+//        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+//        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+//
+//        // This looks for standard video cards, but ignores shorts/ads
+//        val isVideoThumbnail = (desc.contains("views") || desc.contains("ago") || viewId.contains("video_thumbnail"))
+//        val isNotAd = !desc.contains("sponsored") && !desc.contains("ad ·")
+//
+//        if (isVideoThumbnail && isNotAd && node.isClickable) {
+//            return node
+//        }
+//        for (i in 0 until node.childCount) {
+//            val result = findUniversalVideoThumbnail(node.getChild(i))
+//            if (result != null) return result
+//        }
+//        return null
+//    }
 
     // ==========================================
     // 🎛️ NOTIFICATION SYSTEM

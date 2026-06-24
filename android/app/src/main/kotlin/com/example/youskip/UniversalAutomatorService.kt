@@ -335,30 +335,87 @@ class UniversalAutomatorService : AccessibilityService() {
         showPersistentNotification()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (!isMasterSwitchOn) return
+//    override fun onAccessibilityEvent(event: AccessibilityEvent) {
+//        if (!isMasterSwitchOn) return
+//
+//        // 1. Check who fired the event. (This works for the PiP mini-player too!)
+//        val sourcePackage = event.packageName?.toString() ?: ""
+//        if (!sourcePackage.contains("com.google.android.youtube")) return
+//
+//        val currentTime = System.currentTimeMillis()
+//        if (currentTime - lastEventProcessTime < 300) return
+//        lastEventProcessTime = currentTime
+//
+//        // 2. Grab the specific node that triggered the event
+//        val eventNode = event.source ?: return
+//
+//        // 3. Get the root of THAT specific window (This isolates the PiP window)
+//        val windowRoot = eventNode.window?.root ?: eventNode
+//
+//        // Priority 1: ALWAYS look for the Skip Button first
+//        if (huntForSkipButton(windowRoot)) return
+//
+//        // Priority 2: Execute Unskippable Bypass ONLY if it's truly unskippable
+//        if (!playlistBypassLock && isUnskippableAd(windowRoot)) {
+//            routeAdBypass(windowRoot)
+//            return
+//        }
+//    }
+override fun onAccessibilityEvent(event: AccessibilityEvent) {
+    if (!isMasterSwitchOn) return
 
-        // 1. Check who fired the event. (This works for the PiP mini-player too!)
-        val sourcePackage = event.packageName?.toString() ?: ""
-        if (!sourcePackage.contains("com.google.android.youtube")) return
+    // 1. Check who fired the event. (This works for the PiP mini-player too!)
+    val sourcePackage = event.packageName?.toString() ?: ""
+    if (!sourcePackage.contains("com.google.android.youtube")) return
 
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastEventProcessTime < 300) return
-        lastEventProcessTime = currentTime
+    // Prevent the service from running too fast and crashing
+    val currentTime = System.currentTimeMillis()
+    if (currentTime - lastEventProcessTime < 300) return
+    lastEventProcessTime = currentTime
 
-        // 2. Grab the specific node that triggered the event
-        val eventNode = event.source ?: return
+    // 2. Grab the specific node that triggered the event
+    val eventNode = event.source ?: return
 
-        // 3. Get the root of THAT specific window (This isolates the PiP window)
-        val windowRoot = eventNode.window?.root ?: eventNode
+    // 3. Get the root of THAT specific window (This isolates the PiP window)
+    val windowRoot = eventNode.window?.root ?: eventNode
 
-        // Priority 1: ALWAYS look for the Skip Button first
-        if (huntForSkipButton(windowRoot)) return
+    // ==========================================
+    // PRIORITY 1: THE SKIP BUTTON SNIPER
+    // ==========================================
+    if (huntForSkipButton(windowRoot)) {
+        // We found and clicked Skip! Instantly unmute the volume.
+        restoreVolume()
+        return
+    }
 
-        // Priority 2: Execute Unskippable Bypass ONLY if it's truly unskippable
-        if (!playlistBypassLock && isUnskippableAd(windowRoot)) {
-            routeAdBypass(windowRoot)
-            return
+    // ==========================================
+    // PRIORITY 2: THE UNSKIPPABLE AD MUTER
+    // ==========================================
+    // (This entirely replaces the old routeAdBypass logic to protect related videos)
+    val adIsPlaying = isUnskippableAdPlaying(windowRoot)
+
+    if (adIsPlaying && !isMutedForAd) {
+        // SCENARIO A: An ad is playing but we haven't muted yet. Mute it now!
+        originalVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        isMutedForAd = true
+
+    } else if (!adIsPlaying && isMutedForAd) {
+        // SCENARIO B: The ad is completely gone (video is playing). Restore audio!
+        restoreVolume()
+    }
+}
+    private fun restoreVolume() {
+        // Only restore if we are actually currently muted by the ad
+        if (isMutedForAd && originalVolume != -1) {
+
+            // Add this check: Is the audio stream actually active/connected?
+            if (audioManager.isMusicActive) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, originalVolume, 0)
+            }
+
+            isMutedForAd = false
+            originalVolume = -1
         }
     }
 

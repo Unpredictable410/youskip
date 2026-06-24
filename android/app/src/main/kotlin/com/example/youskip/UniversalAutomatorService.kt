@@ -338,21 +338,27 @@ class UniversalAutomatorService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (!isMasterSwitchOn) return
 
+        // 1. Check who fired the event. (This works for the PiP mini-player too!)
+        val sourcePackage = event.packageName?.toString() ?: ""
+        if (!sourcePackage.contains("com.google.android.youtube")) return
+
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastEventProcessTime < 300) return
         lastEventProcessTime = currentTime
 
-        // Note: We check the active window first as it is the most reliable
-        val activeRoot = rootInActiveWindow
-        if (activeRoot != null) {
-            // Priority 1: ALWAYS look for the Skip Button first
-            if (huntForSkipButton(activeRoot)) return
+        // 2. Grab the specific node that triggered the event
+        val eventNode = event.source ?: return
 
-            // Priority 2: Execute Unskippable Bypass ONLY if it's truly unskippable
-            if (!playlistBypassLock && isUnskippableAd(activeRoot)) {
-                routeAdBypass(activeRoot)
-                return
-            }
+        // 3. Get the root of THAT specific window (This isolates the PiP window)
+        val windowRoot = eventNode.window?.root ?: eventNode
+
+        // Priority 1: ALWAYS look for the Skip Button first
+        if (huntForSkipButton(windowRoot)) return
+
+        // Priority 2: Execute Unskippable Bypass ONLY if it's truly unskippable
+        if (!playlistBypassLock && isUnskippableAd(windowRoot)) {
+            routeAdBypass(windowRoot)
+            return
         }
     }
 

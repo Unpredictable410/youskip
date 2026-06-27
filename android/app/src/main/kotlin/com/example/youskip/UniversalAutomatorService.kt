@@ -20,6 +20,7 @@ class UniversalAutomatorService : AccessibilityService() {
     companion object {
         var isMasterSwitchOn: Boolean = true
     }
+
     private val NOTIFICATION_ID = 9999
     private val CHANNEL_ID = "YouSkipStatusChannel"
     private val TOGGLE_ACTION = "com.example.youskip.TOGGLE_ACTION"
@@ -29,13 +30,19 @@ class UniversalAutomatorService : AccessibilityService() {
     private var lastSkipClickTime: Long = 0
     private var lastEventProcessTime: Long = 0
 
-    // The Receiver now ONLY updates the notification when the Tile is clicked
+    // --- 📊 ANALYTICS & STOPWATCH CORE VARIABLES ---
+    private var isTrackingUnskippable = false
+    private var adStartTime: Long = 0
+    private var currentAdvertiser: String = "Unknown Advertiser"
+    private var currentAdProgress: String = "" // NEW: Tracks "1 of 2"
+    private var lastSeenAdProgress: String = "" // NEW: Detects when Ad 1 turns into Ad 2
+
     private val toggleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == TOGGLE_ACTION) {
-                // We sync the variable just in case
                 isMasterSwitchOn = UniversalAutomatorService.isMasterSwitchOn
-
+                // Refresh the notification layout visually when toggled
+                showPersistentNotification()
             }
         }
     }
@@ -50,7 +57,6 @@ class UniversalAutomatorService : AccessibilityService() {
             registerReceiver(toggleReceiver, filter)
         }
 
-        // Bring back the VIP Notification
         showPersistentNotification()
     }
 
@@ -64,12 +70,65 @@ class UniversalAutomatorService : AccessibilityService() {
         if (currentTime - lastEventProcessTime < 300) return
         lastEventProcessTime = currentTime
 
+        // 1. Grab screen root layer securely
         val eventNode = event.source ?: return
         val windowRoot = eventNode.window?.root ?: eventNode
 
-        // --- THE FLAWLESS SNIPER ---
+        // 2. Run the active ad screening logic
+        val adIsOnScreen = isAdActiveOnScreen(windowRoot)
+
+        // 3. RUN THE STOPWATCH & SCRAPER
+        if (adIsOnScreen) {
+            // Actively scrape the DOM for brand names and progress text
+            extractAdDetails(windowRoot)
+
+            if (!isTrackingUnskippable) {
+                // Brand new ad just started
+                isTrackingUnskippable = true
+                adStartTime = System.currentTimeMillis()
+                lastSeenAdProgress = currentAdProgress
+
+            } else if (currentAdProgress == "(2 of 2)" && lastSeenAdProgress == "(1 of 2)") {
+                // 🚨 MID-AD TRANSITION DETECTED!
+                // Ad 1 just finished, Ad 2 just started. Log Ad 1 instantly!
+                val timeElapsedSeconds = (System.currentTimeMillis() - adStartTime) / 1000.0
+                saveAdReceipt("Unskippable Ad $lastSeenAdProgress", timeElapsedSeconds, currentAdvertiser)
+
+                // Reset the clock and variables for Ad 2
+                adStartTime = System.currentTimeMillis()
+                lastSeenAdProgress = currentAdProgress
+                currentAdvertiser = "Unknown Advertiser"
+            }
+
+        } else if (isTrackingUnskippable) {
+            // Ad cleared screen entirely
+            if (adStartTime > 0) {
+                val timeElapsedSeconds = (System.currentTimeMillis() - adStartTime) / 1000.0
+
+                if (timeElapsedSeconds > 3.0) {
+                    val typePrefix = if (lastSeenAdProgress.isNotEmpty()) " $lastSeenAdProgress" else ""
+
+                    // NEW LOGIC: Distinguish between standard unskippable and short auto-skipped ads
+                    val adType = if (timeElapsedSeconds <= 16.0) {
+                        "Short Auto-Skipped$typePrefix"
+                    } else {
+                        "Unskippable Ad$typePrefix"
+                    }
+
+                    saveAdReceipt(adType, timeElapsedSeconds, currentAdvertiser)
+                }
+            }
+
+            // Clean state tracking variables for the next video
+            isTrackingUnskippable = false
+            adStartTime = 0
+            currentAdvertiser = "Unknown Advertiser"
+            currentAdProgress = ""
+            lastSeenAdProgress = ""
+        }
+
+        // 4. Fire target automated actions
         huntForSkipButton(windowRoot)
-        // --- THE BANNER SNIPER ---
         huntForBannerAd(windowRoot)
     }
 
@@ -115,8 +174,26 @@ class UniversalAutomatorService : AccessibilityService() {
 
             lastSkipClickTime = currentTime
             Toast.makeText(applicationContext, "YouSkip: Smashed the Skip Button!", Toast.LENGTH_SHORT).show()
-            // We assume it takes 5 seconds to show the skip button on a standard ad
-            saveAdReceipt("Standard Skippable", 5.0)
+
+            // ---------------------------------------------------------
+            // THE DOUBLE-LOG SHIELD
+            // ---------------------------------------------------------
+            if (isTrackingUnskippable) {
+                val timeToSnipe = (System.currentTimeMillis() - adStartTime) / 1000.0
+
+                // Add the (1 of 2) tag to the skip receipt if it exists!
+                val skipLabel = if (currentAdProgress.isNotEmpty()) "Standard Skippable $currentAdProgress" else "Standard Skippable"
+                saveAdReceipt(skipLabel, timeToSnipe, currentAdvertiser)
+
+                isTrackingUnskippable = false
+                adStartTime = 0
+                currentAdvertiser = "Unknown Advertiser"
+                currentAdProgress = "" // Clear it out
+            } else {
+                saveAdReceipt("Standard Skippable", 5.0, "Unknown Advertiser")
+            }
+            // ---------------------------------------------------------
+
             return true
         }
 
@@ -148,7 +225,7 @@ class UniversalAutomatorService : AccessibilityService() {
 
         if (isAdMenu && node.isClickable) {
             isBannerDismissing = true
-            saveAdReceipt("Overlay Banner", 0.0) // Banners don't really have a 'time'
+            saveAdReceipt("Overlay Banner", 0.0, "Overlay Ad")
             node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
 
             bannerHandler.postDelayed({
@@ -168,6 +245,43 @@ class UniversalAutomatorService : AccessibilityService() {
             if (huntForBannerAd(node.getChild(i))) return true
         }
         return false
+    }
+
+    private fun extractAdDetails(node: AccessibilityNodeInfo?) {
+        if (node == null) return
+
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        val lowerText = text.lowercase()
+        val lowerDesc = desc.lowercase()
+
+        // 1. Detect if it's a Double Ad (1 of 2, 2 of 2)
+        if (lowerText.contains("1 of 2") || lowerDesc.contains("1 of 2")) {
+            currentAdProgress = "(1 of 2)"
+        } else if (lowerText.contains("2 of 2") || lowerDesc.contains("2 of 2")) {
+            currentAdProgress = "(2 of 2)"
+        }
+
+        // 2. Aggressively Hunt for Advertiser Name
+        if (currentAdvertiser == "Unknown Advertiser") {
+            if (lowerText.startsWith("sponsored · ")) {
+                currentAdvertiser = text.substring(12).trim()
+            } else if (lowerText.startsWith("ad · ")) {
+                currentAdvertiser = text.substring(5).trim()
+            } else if (lowerDesc.contains("visit site") && lowerDesc.length > 11) {
+                // YouTube sometimes hides the brand in the CTA button: "Visit site, Samsung"
+                currentAdvertiser = desc.replace("Visit site,", "").replace("visit site", "").trim()
+            }
+
+            // Clean up massive strings just in case it grabbed a whole paragraph
+            if (currentAdvertiser.length > 25) {
+                currentAdvertiser = currentAdvertiser.substring(0, 25) + "..."
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            extractAdDetails(node.getChild(i))
+        }
     }
 
     private fun findNodeByTextOrId(node: AccessibilityNodeInfo?, targetText: String): AccessibilityNodeInfo? {
@@ -191,9 +305,6 @@ class UniversalAutomatorService : AccessibilityService() {
         return null
     }
 
-    // ==========================================
-    // 🎛️ RESTORED NOTIFICATION SYSTEM
-    // ==========================================
     private fun showPersistentNotification() {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -209,7 +320,6 @@ class UniversalAutomatorService : AccessibilityService() {
             this, 1, toggleIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        // This will update dynamically based on the switch!
         val titleText = if (isMasterSwitchOn) "YouSkip is Active" else "YouSkip is Paused"
         val descText = if (isMasterSwitchOn) "Scanning for ads..." else "Ad scanning disabled."
         val buttonText = if (isMasterSwitchOn) "PAUSE" else "RESUME"
@@ -235,16 +345,13 @@ class UniversalAutomatorService : AccessibilityService() {
     // ==========================================
     // 📊 ANALYTICS LEDGER (24-Hour Cache)
     // ==========================================
-    private fun saveAdReceipt(adType: String, timeSavedSec: Double) {
-        // We use a specific file name so Flutter can easily find it later
+    private fun saveAdReceipt(adType: String, timeSavedSec: Double, advertiser: String) {
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
         val editor = prefs.edit()
 
         val currentTime = System.currentTimeMillis()
-        // Default to current time if this is the very first run
         val timerStartTime = prefs.getLong("flutter.AnalyticsStartTime", currentTime)
 
-        // Check if 24 hours (86,400,000 milliseconds) have passed
         val timeElapsed = currentTime - timerStartTime
         val isTimerExpired = timeElapsed >= 86400000
 
@@ -252,24 +359,45 @@ class UniversalAutomatorService : AccessibilityService() {
         var totalAds = prefs.getInt("flutter.TotalAdsToday", 0)
 
         if (isTimerExpired) {
-            // 24 Hours have passed! Wipe the ledger clean.
             existingHistory = ""
             totalAds = 0
-            editor.putLong("flutter.AnalyticsStartTime", currentTime) // Restart the clock
+            editor.putLong("flutter.AnalyticsStartTime", currentTime)
         } else if (timerStartTime == currentTime) {
-            // Very first time running, save the start time
             editor.putLong("flutter.AnalyticsStartTime", currentTime)
         }
 
-        // Format the receipt: "Timestamp|AdType|SecondsSaved"
-        // We use "||" to separate entries so Flutter can easily split them later
-        val newEntry = "$currentTime|$adType|$timeSavedSec"
+        // Formats data payload safely using a 4-part string schema separated by pipes
+        val newEntry = "$currentTime|$adType|$timeSavedSec|$advertiser"
         val updatedHistory = if (existingHistory.isEmpty()) newEntry else "$existingHistory||$newEntry"
 
-        // Save everything back to the phone's memory
         editor.putString("flutter.AdHistory", updatedHistory)
         editor.putInt("flutter.TotalAdsToday", totalAds + 1)
         editor.apply()
+    }
+
+    // ==========================================
+    // 🔍 COMPONENT VIEW SCANNER (Pure Scanner)
+    // ==========================================
+    private fun isAdActiveOnScreen(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+        val text = node.text?.toString()?.lowercase() ?: ""
+
+        if (viewId.contains("ad_progress") ||
+            viewId.contains("ad_badge") ||
+            viewId.contains("player_learn_more_button") ||
+            viewId.contains("ad_cta") ||
+            text.startsWith("ad ·") ||
+            text.contains("sponsored") ||
+            text.contains("video will play after")) {
+            return true
+        }
+
+        for (i in 0 until node.childCount) {
+            if (isAdActiveOnScreen(node.getChild(i))) return true
+        }
+        return false
     }
 
     override fun onInterrupt() {}
